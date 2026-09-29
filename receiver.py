@@ -60,26 +60,10 @@ def jd(value: Any) -> str:
 def parse_form(body: bytes) -> dict[str, str]:
     if not body:
         return {}
-
-    text = body.decode("utf-8", errors="replace")
-    result = {}
-
-    for field in text.split("&"):
-        if "=" in field:
-            key, value = field.split("=", 1)
-        else:
-            key, value = field, ""
-
-        # Important:
-        # Use unquote(), NOT unquote_plus().
-        #
-        # This preserves literal '+' characters in Base64 data.
-        key = urllib.parse.unquote(key)
-        value = urllib.parse.unquote(value)
-
-        result[key] = value
-
-    return result
+    parsed = urllib.parse.parse_qs(
+        body.decode("utf-8", errors="replace"), keep_blank_values=True
+    )
+    return {k: (v[-1] if v else "") for k, v in parsed.items()}
 
 
 def get_cookie(headers: dict[str, str], name: str) -> Optional[str]:
@@ -370,13 +354,181 @@ def handle(ctx):
         return Response.raw(path.read_bytes(), 200, content_type)
 
 
+def create_event_log(app: ReceiverServer, method: str, path: str) -> Path:
+    """Create one folder for one complete APP <-> SERVER transaction."""
+    event_dir = LOG_ROOT / f"{utc_stamp()}_{method}_{safe_name(path.replace('/', '_'))}"
+    (event_dir / "00_APP_TO_SERVER").mkdir(parents=True, exist_ok=True)
+    (event_dir / "01_SERVER_TO_APP").mkdir(parents=True, exist_ok=True)
+    return event_dir
+
+
+def save_app_to_server_log(ctx: RequestContext, event_dir: Path):
+    directory = event_dir / "00_APP_TO_SERVER"
+
+    (directory / "body.bin").write_bytes(ctx.raw_body)
+
+    (directory / "http.json").write_text(
+        jd({
+            "direction": "APP_TO_SERVER",
+            "method": ctx.method,
+            "path": ctx.path,
+            "query": ctx.query,
+            "headers": ctx.headers,
+            "route_prefix": ctx.route_prefix,
+            "relative_path": ctx.relative_path,
+            "cookie": ctx.cookie,
+            "request_id": ctx.request_id,
+        }),
+        encoding="utf-8",
+    )
+
+    form_without_data = dict(ctx.form)
+    if "data" in form_without_data:
+        form_without_data["data"] = "<see data.raw.txt>"
+
+    (directory / "form.json").write_text(
+        jd(form_without_data),
+        encoding="utf-8",
+    )
+
+    if ctx.data_ciphertext is None:
+        (directory / "data.status.txt").write_text(
+            "The application sent no 'data' field.\n",
+            encoding="utf-8",
+        )
+        return
+
+    (directory / "data.raw.txt").write_text(
+        ctx.data_ciphertext,
+        encoding="ascii",
+    )
+
+    if ctx.data_plaintext is not None:
+        (directory / "data.decrypted.txt").write_text(
+            ctx.data_plaintext,
+            encoding="utf-8",
+        )
+
+        if ctx.data_json is not None:
+            (directory / "data.json").write_text(
+                jd(ctx.data_json),
+                encoding="utf-8",
+            )
+
+        (directory / "data.status.json").write_text(
+            jd({
+                "status": "decrypted",
+                "key": ctx.encryption_key_description,
+                "cipher": "AES-256-CBC / PKCS#7",
+            }),
+            encoding="utf-8",
+        )
+    else:
+        (directory / "data.decryption_failed.txt").write_text(
+            "The receiver attempted to decrypt the application's data field "
+            "but could not decode it.\n\n"
+            f"Reason: {ctx.encryption_key_description}\n",
+            encoding="utf-8",
+        )
+
+        (directory / "data.status.json").write_text(
+            jd({
+                "status": "decryption_failed",
+                "key_attempted": ctx.encryption_key_description,
+                "raw_ciphertext_preserved": True,
+            }),
+            encoding="utf-8",
+        )
+
+
+def save_server_to_app_log(response: Response, event_dir: Path):
+    directory = event_dir / "01_SERVER_TO_APP"
+
+    (directory / "body.bin").write_bytes(response.body)
+
+    (directory / "http.json").write_text(
+        jd({
+            "direction": "SERVER_TO_APP",
+            "status": response.status,
+            "headers": response.headers,
+            "body_length": len(response.body),
+        }),
+        encoding="utf-8",
+    )
+
+    try:
+        response_text = response.body.decode("utf-8")
+        (directory / "body.txt").write_text(
+            response_text,
+            encoding="utf-8",
+        )
+
+        try:
+            response_json = json.loads(response_text)
+            (directory / "body.json").write_text(
+                jd(response_json),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    except UnicodeDecodeError:
+        (directory / "body.decode_failed.txt").write_text(
+            "Response body is not valid UTF-8.\n",
+            encoding="utf-8",
+        )
+
+    if len(response.body) > 256:
+        try:
+            decoded = zlib.decompress(response.body[256:]).decode("utf-8")
+            (directory / "table.after_256_zlib.txt").write_text(
+                decoded,
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+
+def save_event_summary(ctx: RequestContext, response: Response, event_dir: Path):
+    (event_dir / "SUMMARY.txt").write_text(
+        "\n".join([
+            "HTTP API EVENT",
+            "==============",
+            f"Request : {ctx.method} {ctx.path}",
+            f"Route   : {ctx.route_prefix}/{ctx.relative_path}",
+            f"rcToken : {ctx.request_id or '(none)'}",
+            "",
+            "APP -> SERVER",
+            f"  data field      : {'present' if ctx.data_ciphertext is not None else 'absent'}",
+            f"  decrypted       : {'yes' if ctx.data_plaintext is not None else 'no'}",
+            f"  decode key      : {ctx.encryption_key_description}",
+            f"  form fields     : {', '.join(ctx.form.keys()) if ctx.form else '(none)'}",
+            "",
+            "SERVER -> APP",
+            f"  HTTP status     : {response.status}",
+            f"  response bytes  : {len(response.body)}",
+            f"  response type   : {response.headers.get('Content-Type', '(unspecified)')}",
+            "",
+            "00_APP_TO_SERVER/  = application -> server",
+            "01_SERVER_TO_APP/ = server -> application",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+
 class HTTPHandler(BaseHTTPRequestHandler):
     server_version = "DPROReceiver/1.0"
 
+
     def handle_request(self):
         app: ReceiverServer = self.server.app
+
+        # ================================================================
+        # APP -> SERVER
+        # ================================================================
         length = int(self.headers.get("Content-Length", "0") or "0")
         raw_body = self.rfile.read(length)
+
         headers = {k: v for k, v in self.headers.items()}
         parsed = urllib.parse.urlsplit(self.path)
         form = parse_form(raw_body)
@@ -389,93 +541,135 @@ class HTTPHandler(BaseHTTPRequestHandler):
 
         if ciphertext:
             try:
-                plaintext, encryption_key, key_description = app.decrypt_request(ciphertext, cookie)
+                plaintext, encryption_key, key_description = app.decrypt_request(
+                    ciphertext,
+                    cookie,
+                )
                 try:
                     data_json = json.loads(plaintext)
                 except Exception:
                     pass
             except Exception as exc:
-                key_description = f"DECRYPT_FAILED: {type(exc).__name__}: {exc}"
+                key_description = (
+                    f"DECRYPT_FAILED: {type(exc).__name__}: {exc}"
+                )
 
         prefix, relative = app.split_route(parsed.path)
         if not prefix:
             prefix, relative = "/APP_HOST", parsed.path.lstrip("/")
 
         ctx = RequestContext(
-            app, self, self.command, self.path, headers, raw_body, form,
-            urllib.parse.parse_qs(parsed.query, keep_blank_values=True),
-            prefix, relative, cookie, ciphertext, plaintext, data_json,
-            encryption_key, key_description,
+            app,
+            self,
+            self.command,
+            self.path,
+            headers,
+            raw_body,
+            form,
+            urllib.parse.parse_qs(
+                parsed.query,
+                keep_blank_values=True,
+            ),
+            prefix,
+            relative,
+            cookie,
+            ciphertext,
+            plaintext,
+            data_json,
+            encryption_key,
+            key_description,
         )
 
-        log_dir = LOG_ROOT / f"{utc_stamp()}_{self.command}_{safe_name(parsed.path.replace('/', '_'))}"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        (log_dir / "request.body.bin").write_bytes(raw_body)
-        (log_dir / "request.json").write_text(jd({
-            "method": self.command,
-            "path": self.path,
-            "headers": headers,
-            "query": ctx.query,
-            "form": form,
-            "cookie": cookie,
-            "route_prefix": prefix,
-            "relative_path": relative,
-            "request_id": ctx.request_id,
-            "encryption_key": key_description,
-        }), encoding="utf-8")
-        if ciphertext:
-            (log_dir / "data.ciphertext.txt").write_text(ciphertext, encoding="ascii")
-        if plaintext is not None:
-            (log_dir / "data.plaintext.txt").write_text(plaintext, encoding="utf-8")
-        if data_json is not None:
-            (log_dir / "data.json").write_text(jd(data_json), encoding="utf-8")
+        event_dir = create_event_log(
+            app,
+            self.command,
+            parsed.path,
+        )
+
+        save_app_to_server_log(ctx, event_dir)
 
         print("\n" + "=" * 100)
-        print(f"[REQ] {self.command} {self.path}")
-        print(f"[ROUTE] {prefix}/{relative}")
-        print(f"[KEY] {key_description}")
-        if form:
-            print("[FORM]", jd(form))
-        if plaintext is not None:
-            print("[DATA]")
-            print(plaintext)
+        print(f"[API EVENT] {self.command} {self.path}")
+        print()
+        print("[APP -> SERVER]")
+        print(f"  route : {prefix}/{relative}")
 
+        form_for_console = dict(form)
+        if "data" in form_for_console:
+            form_for_console["data"] = "<see DATA RAW below>"
+
+        if form_for_console:
+            print(jd(form_for_console))
+        else:
+            print("  (no form fields)")
+
+        if ciphertext is not None:
+            print()
+            print("[APP -> SERVER / DATA RAW]")
+            print(ciphertext)
+            print()
+            print("[APP -> SERVER / DATA DECRYPTED]")
+            if plaintext is not None:
+                print(plaintext)
+            else:
+                print("<DECRYPTION FAILED>")
+                print(f"  {key_description}")
+
+        # ================================================================
+        # SERVER -> APP
+        # ================================================================
         try:
             if prefix in ("/IMG_HOST", "/TABLE_HOST", "/CLAN_HOST"):
                 response = app.serve_static(prefix, relative)
             else:
                 response = app.invoke_endpoint(ctx)
+
         except Exception:
             traceback.print_exc()
-            (log_dir / "exception.txt").write_text(traceback.format_exc(), encoding="utf-8")
-            response = Response.json({"error": 500, "message": "handler exception"}, 500)
+            (event_dir / "exception.txt").write_text(
+                traceback.format_exc(),
+                encoding="utf-8",
+            )
+            response = Response.json(
+                {"error": 500, "message": "handler exception"},
+                500,
+            )
 
-        (log_dir / "response.body.bin").write_bytes(response.body)
-        (log_dir / "response.json").write_text(jd({
-            "status": response.status,
-            "headers": response.headers,
-            "body_length": len(response.body),
-        }), encoding="utf-8")
-        try:
-            (log_dir / "response.text.txt").write_text(response.body.decode("utf-8"), encoding="utf-8")
-        except Exception:
-            pass
-        if len(response.body) > 256:
+        save_server_to_app_log(response, event_dir)
+        save_event_summary(ctx, response, event_dir)
+
+        print()
+        print("[SERVER -> APP]")
+        print(f"  HTTP {response.status}")
+
+        if response.headers:
+            print(jd(response.headers))
+
+        if response.body:
             try:
-                decoded = zlib.decompress(response.body[256:]).decode("utf-8")
-                (log_dir / "response.after_256_zlib.txt").write_text(decoded, encoding="utf-8")
-            except Exception:
-                pass
+                print(response.body.decode("utf-8"))
+            except UnicodeDecodeError:
+                print(f"<binary response: {len(response.body)} bytes>")
+        else:
+            print("<empty body>")
 
-        print(f"[RES] HTTP {response.status} / {len(response.body)} bytes")
+        print()
+        print(f"[LOG] {event_dir}")
         print("=" * 100)
 
         self.send_response(response.status)
+
         for key, value in response.headers.items():
             self.send_header(key, value)
-        self.send_header("Content-Length", str(len(response.body)))
+
+        self.send_header(
+            "Content-Length",
+            str(len(response.body)),
+        )
+
         self.end_headers()
         self.wfile.write(response.body)
+
 
     def do_GET(self):
         self.handle_request()
