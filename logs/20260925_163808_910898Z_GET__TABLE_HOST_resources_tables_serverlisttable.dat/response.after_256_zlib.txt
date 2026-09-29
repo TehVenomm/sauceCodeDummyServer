@@ -1,0 +1,7 @@
+#id,name,url,status,environment,note
+1,Pamela,http://192.168.0.245:8080/,1,prd,
+3,"Pamela Test",http://192.168.0.245:8080/,1,stg,
+4,"Linton Test",http://192.168.0.245:8080/,1,stg,[00ff00]Recommend[/c]
+5,Linton,http://192.168.0.245:8080/,1,prd,[00ff00]Recommend[/c]
+6,"Dragon Slayer",http://192.168.0.245:8080/,0,dev,
+7,Dev,http://192.168.0.245:8080/,1,stg,

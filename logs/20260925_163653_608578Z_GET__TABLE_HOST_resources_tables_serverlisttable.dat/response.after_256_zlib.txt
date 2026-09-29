@@ -1,0 +1,7 @@
+#id,name,url,status,environment,note
+1,Pamela,http://appprd.dragonproject.gogame.net/,1,prd,
+3,"Pamela Test",http://appbeta.dragonproject.gogame.net/,1,stg,
+4,"Linton Test",http://appbeta-01.dragonproject.gogame.net/,1,stg,[00ff00]Recommend[/c]
+5,Linton,http://appprd-01.dragonproject.gogame.net/,1,prd,[00ff00]Recommend[/c]
+6,"Dragon Slayer",http://13.56.7.233/,0,dev,
+7,Dev,http://appstgii.dragonproject.gogame.net/,1,stg,

@@ -1,0 +1,17 @@
+{
+  "purpose": "Dragon Project 1.8.9 local protocol receiver",
+  "listen": "0.0.0.0:8080",
+  "response_mode_default": "plain",
+  "mounts": {
+    "APP_HOST": "./APP_HOST/",
+    "IMG_HOST": "./IMG_HOST/",
+    "TABLE_HOST": "./TABLE_HOST/",
+    "CLAN_HOST": "./CLAN_HOST/"
+  },
+  "serverlist_capture": {
+    "total_body_bytes": 461,
+    "signature_prefix_bytes": 256,
+    "zlib_bytes": 205,
+    "decoded_utf8_bytes": 425
+  }
+}

@@ -1,0 +1,7 @@
+GET /resources/tables//serverlisttable.dat HTTP/1.1
+X-Unity-Version: 2018.4.3f1
+User-Agent: Dalvik/2.1.0 (Linux; U; Android 9; SM-N9600 Build/PPR1.180610.011)
+Host: cdnprd.dragonproject.gogame.net
+Connection: Keep-Alive
+Accept-Encoding: gzip
+
